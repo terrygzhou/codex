@@ -696,6 +696,41 @@ impl ContextManager {
         }
     }
 
+    /// Trim history from the front so the estimated token total fits under `context_window`.
+    ///
+    /// Uses the same byte-based per-item estimator as the auto-compact budget
+    /// (`estimate_item_token_count`), so an N-times-oversized history converges in a
+    /// single pass instead of one item per model round trip. The oldest items are
+    /// removed (with their paired call/output counterparts, via
+    /// [`ContextManager::remove_first_item`]) until the estimate is at or under the
+    /// limit. When every item has been removed, the estimate equals the base
+    /// instructions alone, which may still exceed the limit; the caller must fail
+    /// fast in that case.
+    ///
+    /// Returns `(removed_items, estimated_tokens_before, estimated_tokens_after)`.
+    pub(crate) fn trim_to_fit_context_window(
+        &mut self,
+        context_window: i64,
+        base_instructions: &BaseInstructions,
+    ) -> (usize, i64, i64) {
+        let estimated_before = self
+            .estimate_token_count_with_base_instructions(base_instructions)
+            .unwrap_or(0);
+        let mut removed_items = 0usize;
+        let mut running_estimate = estimated_before;
+        while running_estimate > context_window && !self.items.is_empty() {
+            self.remove_first_item();
+            removed_items += 1;
+            // `remove_first_item` may drop a call/output pair, so the actual delta can
+            // exceed the removed item's own estimate; re-estimate rather than
+            // subtract.
+            running_estimate = self
+                .estimate_token_count_with_base_instructions(base_instructions)
+                .unwrap_or(0);
+        }
+        (removed_items, estimated_before, running_estimate)
+    }
+
     #[cfg(test)]
     pub(crate) fn replace(&mut self, items: Vec<ResponseItem>) {
         self.replace_annotated(items.into_iter().map(ResponseItemEnvelope::new).collect());

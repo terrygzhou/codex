@@ -3564,3 +3564,134 @@ fn text_only_items_count_decoded_content() {
 
     assert_eq!(estimated, "Hello, \"world\"!\nこんにちは".len() as i64);
 }
+
+mod trim_to_fit_tests {
+    use super::*;
+    use codex_history::ResponseItemEnvelope;
+    use codex_protocol::models::BaseInstructions;
+
+    fn base() -> BaseInstructions {
+        BaseInstructions {
+            text: "base instructions".to_string(),
+            provenance: None,
+        }
+    }
+
+    /// Regression test for EYW-695: a history that is N times over the context
+    /// window must converge in a single trim pass (O(1) model round trips),
+    /// leaving a history whose estimate fits under the window.
+    #[test]
+    fn oversized_history_trims_to_fit_in_single_pass() {
+        // Each item is ~1000 bytes, so the estimator (4 bytes/token heuristic)
+        // gives ~250 tokens per item. Window of 1000 tokens => ~4 items fit.
+        let item_count = 30usize; // ~7.5x oversize
+        let items: Vec<ResponseItem> = (0..item_count)
+            .map(|i| user_msg(&format!("{}{}", "x".repeat(1000), i)))
+            .collect();
+        let mut history = ContextManager::new();
+        history.replace_annotated(items.into_iter().map(ResponseItemEnvelope::new).collect());
+
+        let base = base();
+        let estimated_before = history
+            .estimate_token_count_with_base_instructions(&base)
+            .expect("estimate");
+        let context_window = 1000i64;
+        assert!(
+            estimated_before > context_window,
+            "precondition: history must overflow the window"
+        );
+
+        let (removed, before, after) = history.trim_to_fit_context_window(context_window, &base);
+
+        assert!(removed > 0, "expected items to be removed");
+        std::assert_eq!(
+            before,
+            estimated_before,
+            "reported before should match the pre-trim estimate"
+        );
+        assert!(
+            after <= context_window,
+            "trimmed history must fit the window, got {after}"
+        );
+        // The surviving items are the newest ones (front-trim semantics).
+        let remaining = history.annotated_items();
+        std::assert_eq!(remaining.len(), item_count - removed);
+    }
+
+    #[test]
+    fn trim_with_empty_history_is_noop() {
+        let mut history = ContextManager::new();
+        let base = base();
+        let (removed, before, after) = history.trim_to_fit_context_window(1, &base);
+        std::assert_eq!(removed, 0);
+        std::assert_eq!(before, after);
+        assert!(history.annotated_items().is_empty());
+    }
+
+    #[test]
+    fn trim_removes_all_items_when_base_alone_overflows() {
+        let item = user_msg(&"y".repeat(1000));
+        let mut history = ContextManager::new();
+        history.replace_annotated(vec![ResponseItemEnvelope::new(item)]);
+
+        let base = base();
+        // Window smaller than the base instructions estimate.
+        let (removed, _before, after) = history.trim_to_fit_context_window(1, &base);
+        std::assert_eq!(removed, 1);
+        assert!(history.annotated_items().is_empty());
+        // After emptying, the estimate equals base instructions, still over the window.
+        assert!(after > 1);
+    }
+
+    #[test]
+    fn trim_removes_newest_items_last_and_keeps_pairs_intact() {
+        // Interleave oversized tool outputs with small user messages. Front-trim
+        // must drop the oldest items first (with their paired counterparts via
+        // `remove_first_item`) and keep the newest items intact.
+        let item_count = 30usize;
+        let mut items: Vec<ResponseItem> = Vec::new();
+        for i in 0..item_count {
+            let call_id = format!("call-{i}");
+            items.push(custom_tool_call_output(&call_id, &"z".repeat(500)));
+            items.push(user_msg(&format!("user turn {i}")));
+        }
+        let mut history = ContextManager::new();
+        history.replace_annotated(items.into_iter().map(ResponseItemEnvelope::new).collect());
+
+        let base = base();
+        let context_window = 2000i64;
+        let estimated_before = history
+            .estimate_token_count_with_base_instructions(&base)
+            .expect("estimate");
+        std::assert_eq!(
+            estimated_before > context_window,
+            true,
+            "precondition: overflow"
+        );
+
+        let (removed, before, after) = history.trim_to_fit_context_window(context_window, &base);
+        std::assert_eq!(
+            before,
+            estimated_before,
+            "reported before must match pre-trim estimate"
+        );
+        std::assert_eq!(after <= context_window, true, "trimmed history must fit");
+        std::assert_eq!(removed > 0, true, "items must have been removed");
+
+        let remaining = history.annotated_items();
+        std::assert_eq!(
+            removed + remaining.len(),
+            item_count * 2,
+            "conservation of items"
+        );
+        // Newest items survive: the last item must still be the final user message.
+        std::assert_eq!(
+            matches!(
+                &remaining.last().expect("at least one item remains").item,
+                codex_protocol::models::ResponseItem::Message { role, .. } if role == "user"
+            ),
+            true,
+            "newest items must survive front-trim"
+        );
+    }
+}

@@ -56,7 +56,7 @@ use codex_protocol::user_input::UserInput;
 use codex_rollout_trace::InferenceTraceContext;
 use codex_utils_output_truncation::approx_token_count;
 use futures::prelude::*;
-use tracing::error;
+use tracing::warn;
 
 pub use codex_prompts::SUMMARIZATION_PROMPT;
 pub use codex_prompts::SUMMARY_PREFIX;
@@ -303,8 +303,7 @@ async fn run_compact_task_inner_impl(
         sess.services
             .executed_tool_calls
             .attach_to_compaction_prompt(&mut turn_input);
-        let turn_input_len = turn_input.len();
-        let base_instructions = if turn_input
+        let base_instructions_for_prompt = if turn_input
             .iter()
             .any(|item| BaseInstructionsFragment::text_from_item(item).is_some())
         {
@@ -317,7 +316,7 @@ async fn run_compact_task_inner_impl(
         };
         let prompt = Prompt {
             input: turn_input,
-            base_instructions,
+            base_instructions: base_instructions_for_prompt.clone(),
             cyber_access_program: turn_context.cyber_access_program,
             ..Default::default()
         };
@@ -356,17 +355,54 @@ async fn run_compact_task_inner_impl(
                 return Err(e);
             }
             Err(e) if matches!(e.details(), CodexErrorDetails::ContextWindowExceeded) => {
-                if turn_input_len > 1 {
-                    // Trim from the beginning to preserve cache (prefix-based) and keep recent messages intact.
-                    error!(
-                        "Context window exceeded while compacting; removing oldest history item. Error: {e}"
-                    );
-                    history.remove_first_item();
-                    retries = 0;
-                    continue;
+                // Trim the oldest history items in one pass so an N-times-oversized
+                // history converges in O(1) iterations instead of one item per retry.
+                // If the trimmed history still overflows, fail fast with logged
+                // token counts instead of looping.
+                let context_window = match turn_context.model_context_window() {
+                    Some(context_window) => context_window,
+                    None => {
+                        sess.set_total_tokens_full(turn_context.as_ref()).await;
+                        sess.track_turn_codex_error(turn_context.as_ref(), &e);
+                        let event = EventMsg::Error(e.to_error_event(/*message_prefix*/ None));
+                        sess.send_event(&turn_context, event).await;
+                        return Err(e);
+                    }
+                };
+                let compact_prompt_tokens = approx_token_count(
+                    turn_context
+                        .config
+                        .compact_prompt
+                        .as_deref()
+                        .unwrap_or(SUMMARIZATION_PROMPT),
+                ) as i64;
+                // The compact prompt itself is appended to history before every attempt;
+                // reserve its estimated tokens so the surviving history fits together
+                // with it (the same overhead the auto-compact budget already accounts
+                // for).
+                let target_window = context_window.saturating_sub(compact_prompt_tokens);
+                let (removed, before, after) = history
+                    .trim_to_fit_context_window(target_window, &base_instructions_for_prompt);
+                warn!(
+                    context_window,
+                    target_window,
+                    %before,
+                    %after,
+                    removed,
+                    "Context window exceeded while compacting; trimmed oldest history items to fit. Error: {e}"
+                );
+                if removed == 0 || after > target_window {
+                    // Either nothing could be trimmed, or even the minimum viable
+                    // prefix (base instructions + compact prompt) overflows the
+                    // window: no amount of further trimming helps.
+                    sess.set_total_tokens_full(turn_context.as_ref()).await;
+                    sess.track_turn_codex_error(turn_context.as_ref(), &e);
+                    let event = EventMsg::Error(e.to_error_event(/*message_prefix*/ None));
+                    sess.send_event(&turn_context, event).await;
+                    return Err(e);
                 }
-                sess.set_total_tokens_full(turn_context.as_ref()).await;
-                return Err(e);
+                retries = 0;
+                continue;
             }
             Err(e) => {
                 if retries < max_retries {
